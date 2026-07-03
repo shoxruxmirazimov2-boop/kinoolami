@@ -6,8 +6,11 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, CallbackQuery, ChatJoinRequest, LabeledPrice
+from aiogram.filters import Command, StateFilter
+from aiogram.types import (
+    InlineKeyboardButton, CallbackQuery, ChatJoinRequest, LabeledPrice,
+    InputMediaVideo, InputMediaDocument, InputMediaPhoto, InputMediaAnimation, InputMediaAudio,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -73,6 +76,24 @@ class AdminStates(StatesGroup):
     waiting_for_premium_price = State()
     waiting_for_payment_link = State()
     waiting_for_premium_info = State()
+    # --- VIP boshqaruvi ---
+    waiting_for_vip_user = State()
+    waiting_for_vip_amount = State()
+    waiting_for_vip_remove_user = State()
+    # --- Referallar bo'limi ---
+    waiting_for_referral_name = State()
+    waiting_for_referral_amount = State()
+    waiting_for_referral_give_user = State()
+    waiting_for_referral_give_amount = State()
+    waiting_for_referral_take_user = State()
+    # --- Kino boshqaruvi ---
+    waiting_for_movie_add = State()
+    waiting_for_movie_edit_code = State()
+    waiting_for_movie_edit_media = State()
+    waiting_for_movie_delete_code = State()
+    # --- Adminlar boshqaruvi ---
+    waiting_for_admin_add_id = State()
+    waiting_for_admin_remove_id = State()
 
 # --- DATABASE SETUP ---
 def init_db():
@@ -97,6 +118,13 @@ def init_db():
         requested_at TEXT,
         PRIMARY KEY (user_id, channel_id)
     )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS referral_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER,
+        source TEXT,
+        created_at TEXT
+    )''')
     
     # Schema migration: add request_required column if missing
     cursor.execute("PRAGMA table_info(channels)")
@@ -114,6 +142,12 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN premium_until TEXT")
     if "viewed_info" not in user_cols:
         cursor.execute("ALTER TABLE users ADD COLUMN viewed_info INTEGER DEFAULT 0")
+    if "invited_by" not in user_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN invited_by INTEGER")
+    if "referral_count" not in user_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0")
+    if "balance" not in user_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0")
     
     # Default settings
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ('mandatory_enabled', '1'))
@@ -126,6 +160,9 @@ def init_db():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ('premium_info_text', ''))
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ('click_payment_url', ''))
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ('paynet_payment_url', ''))
+    # referral campaign
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ('referral_campaign_name', ''))
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ('referral_reward_money', '0'))
     
     # Add superadmin(s) to admins table
     for sa_id in SUPERADMIN_IDS:
@@ -251,6 +288,66 @@ def set_premium(user_id, duration: timedelta | None):
         (until.strftime('%Y-%m-%d %H:%M:%S'), user_id)
     )
 
+async def resolve_user_id(target: str) -> int | None:
+    """Resolve a user id from @username, t.me link, or raw numeric ID."""
+    target = (target or "").strip()
+    if not target:
+        return None
+    try:
+        if target.startswith("@") or "t.me/" in target:
+            if not target.startswith("@"):
+                target = target.replace("https://", "").replace("http://", "")
+                if target.startswith("t.me/"):
+                    target = "@" + target.split("/")[1].split("?")[0]
+            chat = await bot.get_chat(target)
+            return chat.id
+        return int(target)
+    except Exception:
+        return None
+
+def build_input_media(message: types.Message):
+    """Build an InputMedia object from an incoming message, for editing channel posts."""
+    caption = message.caption
+    if message.video:
+        return InputMediaVideo(media=message.video.file_id, caption=caption)
+    if message.animation:
+        return InputMediaAnimation(media=message.animation.file_id, caption=caption)
+    if message.document:
+        return InputMediaDocument(media=message.document.file_id, caption=caption)
+    if message.photo:
+        return InputMediaPhoto(media=message.photo[-1].file_id, caption=caption)
+    if message.audio:
+        return InputMediaAudio(media=message.audio.file_id, caption=caption)
+    return None
+
+def get_referral_link(bot_username: str, user_id: int) -> str:
+    return f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+def get_referral_campaign() -> tuple[str, int]:
+    name = db_query("SELECT value FROM settings WHERE key = 'referral_campaign_name'", fetchone=True)[0] or ""
+    money_raw = db_query("SELECT value FROM settings WHERE key = 'referral_reward_money'", fetchone=True)[0] or "0"
+    try:
+        money = int(money_raw)
+    except ValueError:
+        money = 0
+    return name, money
+
+def add_referral(referrer_id: int, referred_id: int, source: str = "link", amount: int | None = None) -> int:
+    """Increment referrer's referral_count, log it and credit a money reward to their balance.
+    If amount is None, uses the campaign's preset reward amount (for automatic link referrals).
+    Returns the amount (so'm) credited (0 if none)."""
+    ensure_user(referrer_id, None, None)
+    db_query("UPDATE users SET referral_count = COALESCE(referral_count,0) + 1 WHERE user_id = ?", (referrer_id,))
+    db_query(
+        "INSERT INTO referral_log (referrer_id, referred_id, source, created_at) VALUES (?, ?, ?, ?)",
+        (referrer_id, referred_id, source, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    )
+    if amount is None:
+        _, amount = get_referral_campaign()
+    if amount and amount > 0:
+        db_query("UPDATE users SET balance = COALESCE(balance,0) + ? WHERE user_id = ?", (amount, referrer_id))
+    return amount or 0
+
 # --- BOT INITIALIZATION ---
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -374,13 +471,34 @@ async def on_chat_join_request(request: ChatJoinRequest) -> None:
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
+    already_existed = db_query("SELECT 1 FROM users WHERE user_id = ?", (message.from_user.id,), fetchone=True) is not None
     db_query("INSERT OR IGNORE INTO users (user_id, username, joined_date) VALUES (?, ?, ?)", 
              (message.from_user.id, message.from_user.username, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
 
-    # If admin is currently setting premium prices, don't proceed with normal movie flow
+    # Handle referral deep-link: /start ref_<referrer_id> (only credited once, for brand new users)
+    args0 = message.text.split()
+    if not already_existed and len(args0) > 1 and args0[1].startswith('ref_'):
+        try:
+            referrer_id = int(args0[1].split('_', 1)[1])
+        except ValueError:
+            referrer_id = None
+        if referrer_id and referrer_id != message.from_user.id:
+            already_invited = db_query("SELECT invited_by FROM users WHERE user_id = ?", (message.from_user.id,), fetchone=True)
+            if already_invited and not already_invited[0]:
+                db_query("UPDATE users SET invited_by = ? WHERE user_id = ?", (referrer_id, message.from_user.id))
+                reward_amount = add_referral(referrer_id, message.from_user.id, source="link")
+                try:
+                    _, cur_reward = get_referral_campaign()
+                    note = f" (+{reward_amount} so'm)" if reward_amount > 0 else ""
+                    await bot.send_message(referrer_id, f"🤝 Sizning referal havolangiz orqali yangi foydalanuvchi qo'shildi!{note}")
+                except Exception as exc:
+                    logger.warning("Failed to notify referrer %s: %s", referrer_id, exc)
+
+    # If admin is currently in the middle of an admin FSM flow (setting prices, VIP, referral, etc.),
+    # don't proceed with normal /start movie flow — let the dedicated state handler process the message.
     cur_state = await state.get_state()
-    if cur_state and 'waiting_for_premium_price' in cur_state:
-        await message.answer("Premium narxni sozlayapsiz — avval narxni yuboring yoki /cancel bilan chiqib keting.")
+    if cur_state and cur_state.startswith('AdminStates:'):
+        await message.answer("Joriy amalni avval yakunlang yoki /cancel bilan chiqib keting.")
         return
 
     not_subscribed = await check_subscriptions(message.from_user.id)
@@ -395,8 +513,9 @@ async def start_cmd(message: types.Message, state: FSMContext):
         builder.row(InlineKeyboardButton(text="Qoidalarni o'qidim", callback_data="info_clicked"))
         builder.row(InlineKeyboardButton(text="Tekshirish", callback_data="check_sub"))
 
-    # Always show VIP menu button
-    builder.row(InlineKeyboardButton(text="VIP paketlar", callback_data="vip_menu"))
+    # Always show VIP menu and "my referrals" buttons
+    builder.row(InlineKeyboardButton(text="👑 VIP paketlar", callback_data="vip_menu"))
+    builder.row(InlineKeyboardButton(text="🤝 Mening referallarim", callback_data="my_referral"))
 
     # Reply depending on subscription state; include VIP and any join buttons
     if not_subscribed:
@@ -463,16 +582,12 @@ async def send_movie(message, code):
             "Kod to'g'riligini tekshirib, qayta yuboring."
         )
 
-@dp.message(F.text.isdigit())
+@dp.message(F.text.isdigit(), StateFilter(None))
 async def handle_movie_code(message: types.Message, state: FSMContext):
     # Only accept movie codes in DMs, not in groups/channels
+    # StateFilter(None) ensures this only fires when no admin FSM flow (premium price, VIP,
+    # referral, etc.) is active, so numeric replies (IDs, amounts) reach the correct state handler.
     if message.chat.type != 'private':
-        return
-
-    # Ignore movie-code messages if admin is entering premium prices
-    cur_state = await state.get_state()
-    if cur_state and 'waiting_for_premium_price' in cur_state:
-        await message.answer("Premium narxni sozlayapsiz — avval narxni yuboring yoki /cancel bilan chiqib keting.")
         return
 
     not_subscribed = await check_subscriptions(message.from_user.id)
@@ -488,20 +603,28 @@ async def admin_cmd(message: types.Message):
     if not is_admin(message.from_user.id): return
     
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="Statistika", callback_data="adm_stats"))
-    builder.row(InlineKeyboardButton(text="Kanallar (majburiy)", callback_data="adm_channels"))
-    builder.row(InlineKeyboardButton(text="Reklama (yuborish)", callback_data="adm_broadcast"))
+    builder.row(InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats"))
+    builder.row(InlineKeyboardButton(text="🤝 Referallar", callback_data="adm_referral"))
+    builder.row(InlineKeyboardButton(text="🎬 Kino boshqaruvi", callback_data="adm_movies"))
+    builder.row(InlineKeyboardButton(text="📢 Majburiy obuna", callback_data="adm_channels"))
+    builder.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="adm_users"))
+    builder.row(InlineKeyboardButton(text="👮 Adminlar", callback_data="adm_admins"))
+    builder.row(InlineKeyboardButton(text="📣 Reklama", callback_data="adm_broadcast"))
+    builder.row(InlineKeyboardButton(text="👑 VIP boshqaruvi", callback_data="adm_vip"))
     builder.row(InlineKeyboardButton(text="Premium narx", callback_data="adm_premium"))
     builder.row(InlineKeyboardButton(text="Sozlamalar", callback_data="adm_settings"))
     
     await message.answer(
         "Admin panel:\n"
-        "Statistika, majburiy kanallar, reklama va boshqa sozlamalarni shu yerda boshqaring.",
+        "Kerakli bo'limni tanlang.",
         reply_markup=builder.as_markup()
     )
 
 @dp.callback_query(F.data == "adm_stats")
 async def adm_stats_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
     u_count = db_query("SELECT COUNT(*) FROM users", fetchone=True)[0]
     a_count = db_query("SELECT COUNT(*) FROM admins", fetchone=True)[0]
     c_count = db_query("SELECT COUNT(*) FROM channels", fetchone=True)[0]
@@ -540,30 +663,88 @@ async def adm_stats_cb(callback: CallbackQuery):
     
     await callback.answer()
 
+
+# ============================================================
+# --- FOYDALANUVCHILAR BO'LIMI (USERS SECTION) ---
+# ============================================================
+
+@dp.callback_query(F.data == "adm_users")
+async def adm_users_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    u_count = db_query("SELECT COUNT(*) FROM users", fetchone=True)[0]
+    premium_count = db_query("SELECT COUNT(*) FROM users WHERE is_premium = 1", fetchone=True)[0]
+    today = datetime.now().strftime('%Y-%m-%d')
+    today_count = db_query(
+        "SELECT COUNT(*) FROM users WHERE joined_date LIKE ?", (f"{today}%",), fetchone=True
+    )[0]
+    week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    week_count = db_query(
+        "SELECT COUNT(*) FROM users WHERE joined_date >= ?", (week_ago,), fetchone=True
+    )[0]
+    text = (
+        "👥 Foydalanuvchilar statistikasi:\n\n"
+        f"Jami foydalanuvchilar: {u_count}\n"
+        f"💎 VIP foydalanuvchilar: {premium_count}\n"
+        f"🆕 Bugun qo'shilganlar: {today_count}\n"
+        f"📅 So'nggi 7 kunda qo'shilganlar: {week_count}"
+    )
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="Orqaga", callback_data="adm_back"))
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+# ============================================================
+# --- MAJBURIY OBUNA (CHANNELS SECTION) ---
+# ============================================================
+
 @dp.callback_query(F.data == "adm_channels")
 async def adm_channels_cb(callback: CallbackQuery):
-    channels = db_query("SELECT channel_id, COALESCE(request_required,0) FROM channels", fetchall=True)
-    builder = InlineKeyboardBuilder()
-    for ch, req in channels:
-        label = f"O'chirish: {ch} ({'zayavka' if req else 'oddiy'})"
-        builder.row(InlineKeyboardButton(text=label, callback_data=f"del_ch|{ch}"))
-    builder.row(InlineKeyboardButton(text="Kanal qo'shish (oddiy)", callback_data="add_ch|0"))
-    builder.row(InlineKeyboardButton(text="Kanal qo'shish (zayavka)", callback_data="add_ch|1"))
-    
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
     enabled = db_query("SELECT value FROM settings WHERE key = 'mandatory_enabled'", fetchone=True)[0]
     status_text = "Yoqilgan" if enabled == '1' else "O'chirilgan"
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔗 Kanallar ulash", callback_data="add_ch|0"))
+    builder.row(InlineKeyboardButton(text="🔒 Maxfiy kanal ulash", callback_data="add_ch|1"))
+    builder.row(InlineKeyboardButton(text="📋 Ro'yxat", callback_data="ch_list"))
     builder.row(InlineKeyboardButton(text=f"Holat: {status_text}", callback_data="toggle_mandatory"))
     builder.row(InlineKeyboardButton(text="Orqaga", callback_data="adm_back"))
     
     await callback.message.edit_text(
-        "Majburiy kanallarni boshqarish:\n"
-        "• Oddiy: darhol qo'shadi\n"
-        "• Zayavka: join-request yuboradi",
+        "📢 Majburiy obuna:\n"
+        "• Kanallar ulash: darhol qo'shadi\n"
+        "• Maxfiy kanal ulash: join-request (yashirin) kanal",
         reply_markup=builder.as_markup()
     )
+    await callback.answer()
+
+@dp.callback_query(F.data == "ch_list")
+async def ch_list_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    channels = db_query("SELECT channel_id, COALESCE(request_required,0) FROM channels", fetchall=True)
+    builder = InlineKeyboardBuilder()
+    if not channels:
+        text = "📋 Hozircha majburiy kanallar qo'shilmagan."
+    else:
+        text = "📋 Majburiy kanallar ro'yxati:"
+        for ch, req in channels:
+            label = f"O'chirish: {ch} ({'maxfiy' if req else 'oddiy'})"
+            builder.row(InlineKeyboardButton(text=label, callback_data=f"del_ch|{ch}"))
+    builder.row(InlineKeyboardButton(text="Orqaga", callback_data="adm_channels"))
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "toggle_mandatory")
 async def toggle_mandatory_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
     current = db_query("SELECT value FROM settings WHERE key = 'mandatory_enabled'", fetchone=True)[0]
     new_val = '0' if current == '1' else '1'
     db_query("UPDATE settings SET value = ? WHERE key = 'mandatory_enabled'", (new_val,))
@@ -571,6 +752,9 @@ async def toggle_mandatory_cb(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("add_ch|"))
 async def add_ch_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
     req_flag = callback.data.split("|")[1]
     await state.update_data(request_required=int(req_flag))
     await callback.message.answer(
@@ -582,12 +766,18 @@ async def add_ch_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("del_ch|"))
 async def del_ch_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
     ch_id = callback.data.split("|")[1]
     db_query("DELETE FROM channels WHERE channel_id = ?", (ch_id,))
-    await adm_channels_cb(callback)
+    await ch_list_cb(callback)
 
 @dp.callback_query(F.data == "adm_premium")
 async def adm_premium_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
     p1 = db_query("SELECT value FROM settings WHERE key = 'premium_price_1kun'", fetchone=True)[0]
     p7 = db_query("SELECT value FROM settings WHERE key = 'premium_price_1hafta'", fetchone=True)[0]
     p15 = db_query("SELECT value FROM settings WHERE key = 'premium_price_15kun'", fetchone=True)[0]
@@ -610,7 +800,566 @@ async def adm_premium_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "adm_broadcast")
 async def adm_broadcast_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
     await callback.message.answer("Reklama xabarini yuboring. Forward qilingan yoki to‘g‘ridan-to‘g‘ri matn, rasm va video xabarlar ham o‘tadi.")
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await callback.answer()
+
+
+# ============================================================
+# --- KINO BOSHQARUVI (MOVIE MANAGEMENT) ---
+# ============================================================
+
+@dp.callback_query(F.data == "adm_movies")
+async def adm_movies_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="kino_add_start"))
+    builder.row(InlineKeyboardButton(text="✏️ Kino tahrirlash", callback_data="kino_edit_start"))
+    builder.row(InlineKeyboardButton(text="🗑 Kinoni o'chirish", callback_data="kino_delete_start"))
+    builder.row(InlineKeyboardButton(text="Orqaga", callback_data="adm_back"))
+    await callback.message.edit_text("🎬 Kino boshqaruvi:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data == "kino_add_start")
+async def kino_add_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await callback.message.answer(
+        "Kino uchun video yoki faylni yuboring. Bot uni avtomatik kino kanaliga joylab, kodini beradi."
+    )
+    await state.set_state(AdminStates.waiting_for_movie_add)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_movie_add)
+async def proc_movie_add(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    media = build_input_media(message)
+    if not media:
+        await message.answer("Iltimos, video, hujjat, rasm yoki animatsiya (fayl) yuboring.")
+        return
+    movie_channel = db_query("SELECT value FROM settings WHERE key = 'movie_channel'", fetchone=True)[0]
+    try:
+        sent = await bot.copy_message(chat_id=movie_channel, from_chat_id=message.chat.id, message_id=message.message_id)
+    except Exception as exc:
+        logger.error("Failed to post movie to channel: %s", exc)
+        await message.answer(
+            "Xatolik: kino kanalga joylanmadi. Bot kino kanalida admin ekanligini tekshiring."
+        )
+        return
+    await message.answer(f"✅ Kino kanalga joylandi!\nKodi: {sent.message_id}")
+    await state.clear()
+
+@dp.callback_query(F.data == "kino_edit_start")
+async def kino_edit_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await callback.message.answer("Tahrirlanadigan kino kodini (kanal xabar kodi) yuboring:")
+    await state.set_state(AdminStates.waiting_for_movie_edit_code)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_movie_edit_code)
+async def proc_movie_edit_code(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Iltimos, faqat raqamli kodni yuboring.")
+        return
+    await state.update_data(movie_edit_code=int(raw))
+    await message.answer("Endi shu kino uchun yangi video yoki faylni yuboring:")
+    await state.set_state(AdminStates.waiting_for_movie_edit_media)
+
+@dp.message(AdminStates.waiting_for_movie_edit_media)
+async def proc_movie_edit_media(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    media = build_input_media(message)
+    if not media:
+        await message.answer("Iltimos, video, hujjat, rasm yoki animatsiya (fayl) yuboring.")
+        return
+    data = await state.get_data()
+    code = data.get("movie_edit_code")
+    if not code:
+        await message.answer("Xatolik: kod topilmadi. Qaytadan urinib ko'ring.")
+        await state.clear()
+        return
+    movie_channel = db_query("SELECT value FROM settings WHERE key = 'movie_channel'", fetchone=True)[0]
+    try:
+        await bot.edit_message_media(chat_id=movie_channel, message_id=code, media=media)
+    except Exception as exc:
+        logger.error("Failed to edit movie %s: %s", code, exc)
+        await message.answer(
+            "Xatolik: kino tahrirlanmadi. Kod to'g'riligini va botning kanalda admin ekanligini tekshiring."
+        )
+        return
+    await message.answer(f"✅ Kino (kod: {code}) muvaffaqiyatli tahrirlandi.")
+    await state.clear()
+
+@dp.callback_query(F.data == "kino_delete_start")
+async def kino_delete_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await callback.message.answer("O'chiriladigan kino kodini yuboring:")
+    await state.set_state(AdminStates.waiting_for_movie_delete_code)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_movie_delete_code)
+async def proc_movie_delete_code(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Iltimos, faqat raqamli kodni yuboring.")
+        return
+    code = int(raw)
+    movie_channel = db_query("SELECT value FROM settings WHERE key = 'movie_channel'", fetchone=True)[0]
+    try:
+        await bot.delete_message(chat_id=movie_channel, message_id=code)
+    except Exception as exc:
+        logger.error("Failed to delete movie %s: %s", code, exc)
+        await message.answer("Xatolik: kino o'chirilmadi. Kod to'g'riligini tekshiring.")
+        return
+    await message.answer(f"✅ Kino (kod: {code}) kanaldan o'chirildi.")
+    await state.clear()
+
+
+# ============================================================
+# --- VIP BOSHQARUVI (VIP MANAGEMENT) ---
+# ============================================================
+
+@dp.callback_query(F.data == "adm_vip")
+async def adm_vip_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    vip_count = db_query("SELECT COUNT(*) FROM users WHERE is_premium = 1", fetchone=True)[0]
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🆔 ID orqali VIP berish", callback_data="vip_give_start"))
+    builder.row(InlineKeyboardButton(text="🆔 ID orqali VIP olish", callback_data="vip_remove_start"))
+    builder.row(InlineKeyboardButton(text="📋 Faol VIPlar ro'yxati", callback_data="vip_list"))
+    builder.row(InlineKeyboardButton(text="Orqaga", callback_data="adm_back"))
+    await callback.message.edit_text(
+        f"👑 VIP boshqaruvi\n\nHozirda VIP foydalanuvchilar soni: {vip_count}",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "vip_give_start")
+async def vip_give_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await state.update_data(vip_action="give")
+    await callback.message.answer("Foydalanuvchining ismini (yoki @username, yoki ID) kiriting:")
+    await state.set_state(AdminStates.waiting_for_vip_user)
+    await callback.answer()
+
+@dp.callback_query(F.data == "vip_remove_start")
+async def vip_remove_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await callback.message.answer("VIP olib tashlanadigan foydalanuvchining ismini (yoki @username, yoki ID) kiriting:")
+    await state.set_state(AdminStates.waiting_for_vip_remove_user)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_vip_remove_user)
+async def proc_vip_remove_user(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    target_text = (message.text or "").strip()
+    target_id = await resolve_user_id(target_text)
+    if not target_id:
+        await message.answer("Foydalanuvchi topilmadi. Iltimos, to'g'ri @username yoki ID yuboring.")
+        return
+    set_premium(target_id, None)
+    await message.answer(f"✅ {target_text} foydalanuvchisidan VIP olib tashlandi.")
+    await state.clear()
+
+@dp.message(AdminStates.waiting_for_vip_user)
+async def proc_vip_user(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    target_text = (message.text or "").strip()
+    if not target_text:
+        await message.answer("Iltimos, ismini (yoki @username, yoki ID) kiriting:")
+        return
+    target_id = await resolve_user_id(target_text)
+    if not target_id:
+        await message.answer("Foydalanuvchi topilmadi. Iltimos, to'g'ri @username yoki ID yuboring.")
+        return
+    await state.update_data(vip_target_id=target_id, vip_target_text=target_text)
+    await message.answer("Miqdorni kiriting (masalan: 1kun, 1hafta, 15kun, 30kun):")
+    await state.set_state(AdminStates.waiting_for_vip_amount)
+
+@dp.message(AdminStates.waiting_for_vip_amount)
+async def proc_vip_amount(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    amount_text = (message.text or "").strip()
+    duration = parse_premium_duration(amount_text)
+    if not duration:
+        # allow plain numbers to mean "days"
+        try:
+            days = int(re.sub(r"[^0-9]", "", amount_text))
+            duration = timedelta(days=days) if days > 0 else None
+        except Exception:
+            duration = None
+    if not duration:
+        await message.answer("Muddat tushunarsiz. Masalan: 1kun, 1hafta, 15kun, 30kun yoki shunchaki raqam (kun soni).")
+        return
+    data = await state.get_data()
+    target_id = data.get("vip_target_id")
+    target_text = data.get("vip_target_text", str(target_id))
+    if not target_id:
+        await message.answer("Xatolik: foydalanuvchi tanlanmagan. Qaytadan urinib ko'ring.")
+        await state.clear()
+        return
+    set_premium(target_id, duration)
+    expires = datetime.now() + duration
+    await message.answer(
+        f"✅ {target_text} foydalanuvchisiga VIP berildi.\nAmal qilish muddati: {expires.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    try:
+        await bot.send_message(target_id, f"🎉 Sizga admin tomonidan VIP berildi! Amal qilish muddati: {expires.strftime('%Y-%m-%d %H:%M:%S')}")
+    except Exception as exc:
+        logger.warning("Failed to notify user %s about VIP grant: %s", target_id, exc)
+    await state.clear()
+
+@dp.callback_query(F.data == "vip_list")
+async def vip_list_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    premium_users = db_query(
+        "SELECT user_id, username, premium_until FROM users WHERE is_premium = 1 ORDER BY premium_until DESC",
+        fetchall=True
+    )
+    if not premium_users:
+        await callback.message.answer("Hozircha VIP foydalanuvchilar yo'q.")
+    else:
+        text = "👑 VIP Foydalanuvchilar:\n\n"
+        for user_id, username, until_date in premium_users:
+            user_mention = f"@{username}" if username else f"ID: {user_id}"
+            text += f"• {user_mention} — {until_date}\n"
+        await callback.message.answer(text)
+    await callback.answer()
+
+
+# ============================================================
+# --- REFERALLAR BO'LIMI (REFERRAL SYSTEM) ---
+# ============================================================
+
+@dp.callback_query(F.data == "adm_referral")
+async def adm_referral_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    name, reward_money = get_referral_campaign()
+    total_referrals = db_query("SELECT COUNT(*) FROM referral_log", fetchone=True)[0]
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🆕 Yaratish", callback_data="ref_create_start"))
+    builder.row(InlineKeyboardButton(text="📋 Ro'yxat", callback_data="ref_list"))
+    builder.row(InlineKeyboardButton(text="➕ Referal berish", callback_data="ref_give_start"))
+    builder.row(InlineKeyboardButton(text="➖ Referal olish", callback_data="ref_take_start"))
+    builder.row(InlineKeyboardButton(text="♻️ Restart", callback_data="ref_restart"))
+    builder.row(InlineKeyboardButton(text="Orqaga", callback_data="adm_back"))
+    info_text = (
+        "🤝 Referallar bo'limi\n\n"
+        f"Faol kampaniya: {name if name else '(o‘rnatilmagan)'}\n"
+        f"Mukofot: {reward_money} so'm har bir referal uchun\n"
+        f"Jami referallar: {total_referrals}\n\n"
+        "Yaratish — yangi referal kampaniyasi (nom + mukofot summasi)\n"
+        "Ro'yxat — eng ko'p referal keltirganlar\n"
+        "Referal berish — foydalanuvchiga qo'lda referal va pul mukofoti berish\n"
+        "Referal olish — foydalanuvchidan referal hisobini kamaytirish"
+    )
+    await callback.message.edit_text(info_text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data == "ref_create_start")
+async def ref_create_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await callback.message.answer("Referal kampaniyasi uchun ismini kiriting:")
+    await state.set_state(AdminStates.waiting_for_referral_name)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_referral_name)
+async def proc_referral_name(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Iltimos, ismini kiriting:")
+        return
+    await state.update_data(referral_name=name)
+    await message.answer("Miqdorni kiriting (har bir referal uchun necha so'm beriladi, masalan: 1000):")
+    await state.set_state(AdminStates.waiting_for_referral_amount)
+
+@dp.message(AdminStates.waiting_for_referral_amount)
+async def proc_referral_amount(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    try:
+        amount = int(re.sub(r"[^0-9]", "", raw))
+    except Exception:
+        amount = None
+    if amount is None:
+        await message.answer("Iltimos, miqdorni faqat raqam bilan yuboring (masalan: 1000):")
+        return
+    data = await state.get_data()
+    name = data.get("referral_name", "")
+    db_query("UPDATE settings SET value = ? WHERE key = 'referral_campaign_name'", (name,))
+    db_query("UPDATE settings SET value = ? WHERE key = 'referral_reward_money'", (str(amount),))
+    await message.answer(
+        f"✅ Referal kampaniyasi yaratildi!\nNomi: {name}\nMukofot: {amount} so'm (har bir referal uchun)\n\n"
+        "Foydalanuvchilar o'zlarining shaxsiy havolasi orqali do'stlarini taklif qilib, bu mukofotni olishlari mumkin."
+    )
+    await state.clear()
+
+@dp.callback_query(F.data == "ref_list")
+async def ref_list_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    name, reward_money = get_referral_campaign()
+    top = db_query(
+        "SELECT user_id, username, COALESCE(referral_count,0), COALESCE(balance,0) FROM users WHERE COALESCE(referral_count,0) > 0 "
+        "ORDER BY referral_count DESC LIMIT 20",
+        fetchall=True
+    )
+    text = f"📋 Referallar ro'yxati\n\nKampaniya: {name if name else '(o‘rnatilmagan)'} — {reward_money} so'm/referal\n\n"
+    if not top:
+        text += "Hozircha hech kim referal keltirmagan."
+    else:
+        for user_id, username, count, balance in top:
+            mention = f"@{username}" if username else f"ID: {user_id}"
+            text += f"• {mention} — {count} ta referal, balans: {balance} so'm\n"
+    await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "ref_give_start")
+async def ref_give_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await callback.message.answer("Referal mukofoti beriladigan foydalanuvchining ismini (yoki @username, yoki ID) kiriting:")
+    await state.set_state(AdminStates.waiting_for_referral_give_user)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_referral_give_user)
+async def proc_referral_give(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    target_text = (message.text or "").strip()
+    target_id = await resolve_user_id(target_text)
+    if not target_id:
+        await message.answer("Foydalanuvchi topilmadi. Iltimos, to'g'ri @username yoki ID yuboring.")
+        return
+    await state.update_data(referral_give_target_text=target_text, referral_give_target_id=target_id)
+    await message.answer("Miqdorni kiriting:")
+    await state.set_state(AdminStates.waiting_for_referral_give_amount)
+
+@dp.message(AdminStates.waiting_for_referral_give_amount)
+async def proc_referral_give_amount(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    try:
+        amount = int(re.sub(r"[^0-9]", "", raw))
+    except Exception:
+        amount = None
+    if amount is None or amount <= 0:
+        await message.answer("Iltimos, miqdorni faqat musbat raqam bilan yuboring (masalan: 1000):")
+        return
+    data = await state.get_data()
+    target_id = data.get("referral_give_target_id")
+    target_text = data.get("referral_give_target_text", str(target_id))
+    if not target_id:
+        await message.answer("Xatolik: foydalanuvchi topilmadi. Qaytadan urinib ko'ring.")
+        await state.clear()
+        return
+    add_referral(target_id, target_id, source="manual", amount=amount)
+    await message.answer(f"✅ {target_text} foydalanuvchisiga referal hisobi va +{amount} so'm berildi.")
+    try:
+        await bot.send_message(target_id, f"🎉 Sizga admin tomonidan referal mukofoti berildi: +{amount} so'm!")
+    except Exception as exc:
+        logger.warning("Failed to notify user %s about referral grant: %s", target_id, exc)
+    await state.clear()
+
+@dp.callback_query(F.data == "ref_take_start")
+async def ref_take_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await callback.message.answer("Referal hisobi kamaytiriladigan foydalanuvchining ismini (yoki @username, yoki ID) kiriting:")
+    await state.set_state(AdminStates.waiting_for_referral_take_user)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_referral_take_user)
+async def proc_referral_take(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    target_text = (message.text or "").strip()
+    target_id = await resolve_user_id(target_text)
+    if not target_id:
+        await message.answer("Foydalanuvchi topilmadi. Iltimos, to'g'ri @username yoki ID yuboring.")
+        return
+    row = db_query("SELECT COALESCE(referral_count,0) FROM users WHERE user_id = ?", (target_id,), fetchone=True)
+    current_count = row[0] if row else 0
+    if current_count <= 0:
+        await message.answer(f"{target_text} foydalanuvchisida referal hisobi yo'q (0).")
+        await state.clear()
+        return
+    db_query("UPDATE users SET referral_count = referral_count - 1 WHERE user_id = ?", (target_id,))
+    await message.answer(f"✅ {target_text} foydalanuvchisidan 1 ta referal hisobi olib tashlandi. Yangi hisob: {current_count - 1}")
+    await state.clear()
+
+@dp.callback_query(F.data == "ref_restart")
+async def ref_restart_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="✅ Ha, tozalash", callback_data="ref_restart_confirm"))
+    builder.row(InlineKeyboardButton(text="Bekor qilish", callback_data="adm_referral"))
+    await callback.message.edit_text(
+        "⚠️ Diqqat! Barcha referal statistikasi (hisoblar va tarix) tozalanadi. Kampaniya sozlamalari (nom/mukofot) saqlanib qoladi.\n\nDavom etasizmi?",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "ref_restart_confirm")
+async def ref_restart_confirm_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    db_query("UPDATE users SET referral_count = 0, invited_by = NULL")
+    db_query("DELETE FROM referral_log")
+    await callback.message.edit_text("♻️ Referal statistikasi tozalandi.")
+    await callback.answer("Bajarildi!")
+
+
+# ============================================================
+# --- ADMINLAR BO'LIMI (ADMIN MANAGEMENT) ---
+# ============================================================
+
+@dp.callback_query(F.data == "adm_admins")
+async def adm_admins_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    a_count = db_query("SELECT COUNT(*) FROM admins", fetchone=True)[0]
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="admin_add_start"))
+    builder.row(InlineKeyboardButton(text="➖ Admin o'chirish", callback_data="admin_remove_start"))
+    builder.row(InlineKeyboardButton(text="📋 Ro'yxat", callback_data="admin_list"))
+    builder.row(InlineKeyboardButton(text="Orqaga", callback_data="adm_back"))
+    await callback.message.edit_text(
+        f"👮 Adminlar boshqaruvi\n\nHozirgi adminlar soni: {a_count}",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_add_start")
+async def admin_add_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await callback.message.answer("Yangi adminning ID raqamini yoki @username yuboring:")
+    await state.set_state(AdminStates.waiting_for_admin_add_id)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_admin_add_id)
+async def proc_admin_add(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    target_text = (message.text or "").strip()
+    target_id = await resolve_user_id(target_text)
+    if not target_id:
+        await message.answer("Foydalanuvchi topilmadi. Iltimos, to'g'ri ID yoki @username yuboring.")
+        return
+    if is_admin(target_id):
+        await message.answer("Bu foydalanuvchi allaqachon admin.")
+        await state.clear()
+        return
+    db_query("INSERT OR IGNORE INTO admins (user_id, added_by) VALUES (?, ?)", (target_id, message.from_user.id))
+    await message.answer(f"✅ {target_text} admin sifatida qo'shildi.")
+    try:
+        await bot.send_message(target_id, "🎉 Sizga admin huquqi berildi!")
+    except Exception as exc:
+        logger.warning("Failed to notify new admin %s: %s", target_id, exc)
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_remove_start")
+async def admin_remove_start_cb(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    await callback.message.answer("O'chiriladigan adminning ID raqamini yoki @username yuboring:")
+    await state.set_state(AdminStates.waiting_for_admin_remove_id)
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_admin_remove_id)
+async def proc_admin_remove(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    target_text = (message.text or "").strip()
+    target_id = await resolve_user_id(target_text)
+    if not target_id:
+        await message.answer("Foydalanuvchi topilmadi. Iltimos, to'g'ri ID yoki @username yuboring.")
+        return
+    if target_id in SUPERADMIN_IDS:
+        await message.answer("Superadminni o'chirib bo'lmaydi.")
+        await state.clear()
+        return
+    db_query("DELETE FROM admins WHERE user_id = ?", (target_id,))
+    await message.answer(f"✅ {target_text} adminlikdan chiqarildi.")
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_list")
+async def admin_list_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat adminlar mumkin", show_alert=True)
+        return
+    admins = db_query(
+        "SELECT a.user_id, u.username FROM admins a LEFT JOIN users u ON a.user_id = u.user_id",
+        fetchall=True
+    )
+    text = "👮 Adminlar ro'yxati:\n\n"
+    for user_id, username in admins:
+        mention = f"@{username}" if username else f"ID: {user_id}"
+        tag = " (superadmin)" if user_id in SUPERADMIN_IDS else ""
+        text += f"• {mention}{tag}\n"
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="Orqaga", callback_data="adm_admins"))
+    await callback.message.answer(text, reply_markup=builder.as_markup())
     await callback.answer()
 
 
@@ -628,11 +1377,39 @@ async def vip_menu_cb(callback: CallbackQuery):
     builder.row(InlineKeyboardButton(text=f"1 hafta — {show_price(p7)}", callback_data="buy_premium|1hafta"))
     builder.row(InlineKeyboardButton(text=f"15 kun — {show_price(p15)}", callback_data="buy_premium|15kun"))
     builder.row(InlineKeyboardButton(text=f"30 kun — {show_price(p30)}", callback_data="buy_premium|30kun"))
+    _, ref_reward = get_referral_campaign()
+    if ref_reward > 0:
+        builder.row(InlineKeyboardButton(text="🤝 Referal orqali pul ishlash", callback_data="my_referral"))
     builder.row(InlineKeyboardButton(text="Orqaga", callback_data="vip_back"))
     text = "VIP paketlar:"
     if info:
         text = f"{info}\n\n{text}"
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "my_referral")
+async def my_referral_cb(callback: CallbackQuery):
+    me = await bot.get_me()
+    bot_username = getattr(me, 'username', None)
+    if not bot_username:
+        await callback.answer("Xatolik yuz berdi, keyinroq urinib ko'ring.", show_alert=True)
+        return
+    link = get_referral_link(bot_username, callback.from_user.id)
+    row = db_query(
+        "SELECT COALESCE(referral_count,0), COALESCE(balance,0) FROM users WHERE user_id = ?",
+        (callback.from_user.id,), fetchone=True
+    )
+    count = row[0] if row else 0
+    balance = row[1] if row else 0
+    name, reward_money = get_referral_campaign()
+    await callback.message.answer(
+        "🤝 Sizning shaxsiy referal havolangiz:\n"
+        f"{link}\n\n"
+        f"Do'stlaringizni shu havola orqali taklif qiling — har bir taklif uchun {reward_money} so'm olasiz!\n"
+        f"Siz hozirgacha {count} ta do'st taklif qildingiz.\n"
+        f"💰 Balansingiz: {balance} so'm"
+    )
     await callback.answer()
 
 
@@ -1128,6 +1905,15 @@ async def proc_broadcast(message: types.Message, state: FSMContext):
         await asyncio.sleep(0.05)
     await msg.edit_text(f"Tugatildi. {count} ta foydalanuvchiga yuborildi.")
     await state.clear()
+
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: types.Message, state: FSMContext):
+    cur_state = await state.get_state()
+    if cur_state is None:
+        await message.answer("Bekor qilinadigan amal yo'q.")
+        return
+    await state.clear()
+    await message.answer("❌ Amal bekor qilindi.")
 
 async def main():
     init_db()
